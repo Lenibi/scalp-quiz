@@ -728,6 +728,15 @@ function setLoading(text) {
   if (text) { el.textContent = text; el.classList.remove('hidden'); }
   else      { el.classList.add('hidden'); }
 }
+function _resetBannerToBlank() {
+  const banner = document.getElementById('result-banner');
+  banner.className = '';   // remove show/multi/correct/wrong
+  while (banner.firstChild) banner.removeChild(banner.firstChild);
+  const verdict = document.createElement('span'); verdict.id = 'result-verdict';
+  const detail = document.createElement('span'); detail.id = 'result-detail';
+  banner.appendChild(verdict);
+  banner.appendChild(detail);
+}
 function renderQuestion(q) {
   hideCursorLine();
   document.getElementById('q-ticker').textContent = q.ticker;
@@ -746,9 +755,7 @@ function renderQuestion(q) {
   } catch (e) {
     chart.timeScale().fitContent();
   }
-  document.getElementById('result-banner').className = '';
-  document.getElementById('result-verdict').textContent = '';
-  document.getElementById('result-detail').textContent = '';
+  _resetBannerToBlank();
   document.getElementById('next-btn').className = '';
   document.getElementById('btn-up').disabled = false;
   document.getElementById('btn-down').disabled = false;
