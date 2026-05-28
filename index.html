@@ -248,6 +248,16 @@
 
   <div id="controls">
     <div class="horizon-row">
+      <label for="bucket-sel">Candle size</label>
+      <select id="bucket-sel">
+        <option value="30">30 sec</option>
+        <option value="60" selected>1 min</option>
+        <option value="300">5 min</option>
+        <option value="600">10 min</option>
+        <option value="3600">Hourly</option>
+      </select>
+    </div>
+    <div class="horizon-row">
       <label for="horizon-sel">Predict direction in</label>
       <select id="horizon-sel">
         <option value="5">5 min</option>
@@ -281,10 +291,13 @@ const DAYS_DIR = 'days_1min';
 const TICKERS = ['SOXL', 'MSTR', 'COIN', 'NVDA', 'TQQQ', 'TSLA'];   // all 6 from V7-CD universe
 const CONTEXT_DAYS = 4;                 // walk back N prior trading days
 const INITIAL_VIEW_HOURS = 24;          // default chart shows last 24h before T (user can zoom out)
-const BUCKET_SECONDS = 60;
 const NEUTRAL_THRESHOLD_PCT = 0.10;
 const RTH_START_MIN = 9 * 60 + 35;
 const LS_STATS_KEY  = 'scalp_quiz_stats_v1';
+const LS_BUCKET_KEY = 'scalp_quiz_bucket_seconds';
+// Mutable: user can change this via the bucket dropdown. Source data is 1-min,
+// so values below 60 just produce identical-OHLC bars (no extra detail).
+let BUCKET_SECONDS = parseInt(localStorage.getItem(LS_BUCKET_KEY) || '60', 10);
 
 // ============================================================
 // STATE
@@ -718,6 +731,34 @@ document.getElementById('next-btn').addEventListener('click', () => { nextQuesti
 document.getElementById('horizon-sel').addEventListener('change', () => {
   if (!answered) nextQuestion();
 });
+
+// Bucket-size dropdown: re-aggregate current question's bars at the new
+// bucket and redraw, without picking a new question. Persists in localStorage.
+function _redrawAtCurrentBucket() {
+  if (!currentQ) return;
+  const bars = answered
+    ? currentQ.contextBars.concat(currentQ.futureBars)
+    : currentQ.contextBars;
+  const candles = aggregateToBucket(bars, BUCKET_SECONDS);
+  candleSeries.setData(candles);
+  setVwapData(candles);
+  // Re-apply the appropriate visible range so the user stays anchored.
+  const target = answered
+    ? { from: currentQ.T - 3 * 3600, to: currentQ.T + (currentQ.horizonMin + 30) * 60 }
+    : { from: currentQ.T - INITIAL_VIEW_HOURS * 3600, to: currentQ.T + 30 * 60 };
+  try { chart.timeScale().setVisibleRange(target); } catch (e) {}
+}
+const _bucketSel = document.getElementById('bucket-sel');
+if (_bucketSel) {
+  _bucketSel.value = String(BUCKET_SECONDS);
+  _bucketSel.addEventListener('change', e => {
+    const v = parseInt(e.target.value, 10);
+    if (!v || v <= 0) return;
+    BUCKET_SECONDS = v;
+    localStorage.setItem(LS_BUCKET_KEY, String(v));
+    _redrawAtCurrentBucket();
+  });
+}
 document.getElementById('reset-stats-btn').addEventListener('click', () => {
   if (!confirm('Reset all stats?')) return;
   stats = { total: 0, correct: 0, streak: 0, bestStreak: 0, byHorizon: {}, byTicker: {} };
