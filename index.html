@@ -737,6 +737,12 @@ function _resetBannerToBlank() {
   banner.appendChild(verdict);
   banner.appendChild(detail);
 }
+function _resetChartScales() {
+  // After setData replaces all bars, force both scales to recompute so the
+  // Y-axis isn't stuck on the previous question's price range.
+  try { chart.timeScale().fitContent(); } catch (e) {}
+  try { chart.priceScale('right').applyOptions({ autoScale: true }); } catch (e) {}
+}
 function renderQuestion(q) {
   hideCursorLine();
   document.getElementById('q-ticker').textContent = q.ticker;
@@ -744,6 +750,7 @@ function renderQuestion(q) {
   const candles = aggregateToBucket(q.contextBars, BUCKET_SECONDS);
   candleSeries.setData(candles);
   setVwapData(candles);
+  _resetChartScales();
   // Default visible window: last ~24h before T. User can pinch out to see
   // the full 4-day context. (Skipping fitContent() because with 4 days of
   // 1-min candles, fitContent squishes everything too small to read.)
@@ -853,6 +860,7 @@ function revealOutcome(userSaidUp) {
   const candles = aggregateToBucket(all, BUCKET_SECONDS);
   candleSeries.setData(candles);
   setVwapData(candles);
+  _resetChartScales();
   // Reveal zoom: from 3h before T through end of today's data.
   const todayBars = currentQ.todayBars || all;
   const lastT = todayBars[todayBars.length - 1].t;
@@ -966,6 +974,7 @@ function _redrawAtCurrentBucket() {
   const candles = aggregateToBucket(bars, BUCKET_SECONDS);
   candleSeries.setData(candles);
   setVwapData(candles);
+  _resetChartScales();
   // Re-apply the appropriate visible range so the user stays anchored.
   const target = answered
     ? { from: currentQ.T - 3 * 3600, to: currentQ.T + (currentQ.horizonMin + 30) * 60 }
