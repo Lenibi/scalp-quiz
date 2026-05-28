@@ -276,7 +276,9 @@
 // CONFIG
 // ============================================================
 const DATA_BASE = 'https://lenibi.github.io/scalp-sim/data';
-const TICKERS = ['SOXL', 'MSTR'];
+const CATALOG_FILE = 'sessions_catalog_1min.json';
+const DAYS_DIR = 'days_1min';
+const TICKERS = ['SOXL', 'MSTR', 'COIN', 'NVDA', 'TQQQ', 'TSLA'];   // all 6 from V7-CD universe
 const CONTEXT_DAYS = 4;                 // walk back N prior trading days
 const INITIAL_VIEW_HOURS = 24;          // default chart shows last 24h before T (user can zoom out)
 const BUCKET_SECONDS = 60;
@@ -347,16 +349,17 @@ function recordResult(correct, horizon, ticker) {
 // ============================================================
 async function loadCatalog() {
   if (CATALOG) return CATALOG;
-  const r = await fetch(DATA_BASE + '/sessions_catalog.json');
+  const r = await fetch(DATA_BASE + '/' + CATALOG_FILE);
   if (!r.ok) throw new Error('catalog fetch failed: ' + r.status);
-  CATALOG = (await r.json()).filter(s => TICKERS.includes(s.ticker) && s.has_5sec);
+  // Catalog has both 5-sec and 1-min entries; we want the 1-min variant.
+  CATALOG = (await r.json()).filter(s => TICKERS.includes(s.ticker));
   return CATALOG;
 }
 const _dayCache = new Map();
 async function loadDay(ticker, date) {
   const key = ticker + '_' + date;
   if (_dayCache.has(key)) return _dayCache.get(key);
-  const r = await fetch(DATA_BASE + '/days_5sec/' + key + '.json');
+  const r = await fetch(DATA_BASE + '/' + DAYS_DIR + '/' + key + '.json');
   if (!r.ok) throw new Error('day fetch failed: ' + key);
   const bars = await r.json();
   _dayCache.set(key, bars);
@@ -381,6 +384,7 @@ function initChart() {
       borderColor: '#2a3140',
       timeVisible: true,
       secondsVisible: false,
+      minBarSpacing: 0.05,    // allow extreme zoom-out so 4 days fit on screen
     },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     handleScroll: true,
@@ -393,8 +397,8 @@ function initChart() {
     priceLineVisible: false,
     lastValueVisible: true,
   });
-  // VWAP (yellow dashed) + 2sigma bands (upper blue, lower pink). Rolling
-  // window so they don't trumpet from zero. RTH-only -- gap during pre-market.
+  // VWAP series setup happens via a per-DAY pool. First triplet created
+  // up front; more added lazily as multi-day context expands the day count.
   vwapSeries = chart.addLineSeries({
     color: '#f6c143', lineWidth: 1,
     lineStyle: LightweightCharts.LineStyle.Dashed,
@@ -411,50 +415,94 @@ function initChart() {
     priceLineVisible: false, crosshairMarkerVisible: false,
     lastValueVisible: false,
   });
+  VWAP_DAY_POOL.push({ vwap: vwapSeries, upper: upperSeries, lower: lowerSeries });
 }
 
-// Bucketed candles already use BUCKET_SECONDS (60s). The rolling window is
-// 15 minutes -> 15 bars. ±2sigma matches the scalp-sim convention.
-function _vwapBands(candles) {
+// One {vwap, upper, lower} triplet per RTH day visible on the chart, so
+// lightweight-charts physically cannot draw a line across overnight gaps.
+const VWAP_DAY_POOL = [];
+function _ensureVwapDay(idx) {
+  while (VWAP_DAY_POOL.length <= idx) {
+    VWAP_DAY_POOL.push({
+      vwap:  chart.addLineSeries({ color: '#f6c143', lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false }),
+      upper: chart.addLineSeries({ color: '#66aaff', lineWidth: 1,
+        priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false }),
+      lower: chart.addLineSeries({ color: '#ff77bb', lineWidth: 1,
+        priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false }),
+    });
+  }
+  return VWAP_DAY_POOL[idx];
+}
+
+// Per-day rolling-window VWAP + ±2sigma bands. Each day's RTH segment
+// goes on its own line series so no line ever crosses an overnight gap.
+function _vwapBandsByDay(candles) {
   const WINDOW_BARS = 15;
   const SIGMA_MULT = 2;
   const MIN_BARS = 5;
-  const vwap = [], upper = [], lower = [];
-  const queue = [];
-  let sumPV = 0, sumV = 0, sumP2V = 0;
+  const days = new Map();
+  // First group RTH candles by ET date so each day has its own rolling state.
   for (const c of candles) {
-    const mod = etMinuteOfDay(c.time);
+    const d = new Date(c.time * 1000);
+    const mod = d.getUTCHours() * 60 + d.getUTCMinutes();
     const inRTH = mod >= 9 * 60 + 30 && mod < 16 * 60;
     if (!inRTH) continue;
-    const typical = (c.high + c.low + c.close) / 3;
-    // No volume in the aggregated candle (we don't aggregate volume here),
-    // so weight every bar equally by using a synthetic v=1. The bands
-    // become simple price stddev around the typical-price moving avg --
-    // same shape as a true VWAP at small intraday scales.
-    const v = 1;
-    const pv = typical * v;
-    const p2v = typical * typical * v;
-    queue.push({ pv, v, p2v });
-    sumPV += pv; sumV += v; sumP2V += p2v;
-    if (queue.length > WINDOW_BARS) {
-      const old = queue.shift();
-      sumPV -= old.pv; sumV -= old.v; sumP2V -= old.p2v;
-    }
-    if (queue.length < MIN_BARS || sumV <= 0) continue;
-    const m = sumPV / sumV;
-    const variance = Math.max(0, sumP2V / sumV - m * m);
-    const sigma = Math.sqrt(variance);
-    vwap.push({ time: c.time, value: m });
-    upper.push({ time: c.time, value: m + SIGMA_MULT * sigma });
-    lower.push({ time: c.time, value: m - SIGMA_MULT * sigma });
+    const key = d.getUTCFullYear() + '-' + d.getUTCMonth() + '-' + d.getUTCDate();
+    if (!days.has(key)) days.set(key, []);
+    days.get(key).push(c);
   }
-  return { vwap, upper, lower };
+  // For each day, compute the rolling-window VWAP+bands.
+  const segments = [];
+  const sortedKeys = Array.from(days.keys()).sort((a, b) => {
+    // Sort by the first bar's time for deterministic ordering.
+    return days.get(a)[0].time - days.get(b)[0].time;
+  });
+  for (const key of sortedKeys) {
+    const dayBars = days.get(key);
+    const queue = [];
+    let sumPV = 0, sumV = 0, sumP2V = 0;
+    const seg = { vwap: [], upper: [], lower: [] };
+    for (const c of dayBars) {
+      const typical = (c.high + c.low + c.close) / 3;
+      const v = 1;
+      const pv = typical * v;
+      const p2v = typical * typical * v;
+      queue.push({ pv, v, p2v });
+      sumPV += pv; sumV += v; sumP2V += p2v;
+      if (queue.length > WINDOW_BARS) {
+        const old = queue.shift();
+        sumPV -= old.pv; sumV -= old.v; sumP2V -= old.p2v;
+      }
+      if (queue.length < MIN_BARS || sumV <= 0) continue;
+      const m = sumPV / sumV;
+      const variance = Math.max(0, sumP2V / sumV - m * m);
+      const sigma = Math.sqrt(variance);
+      seg.vwap.push({ time: c.time, value: m });
+      seg.upper.push({ time: c.time, value: m + SIGMA_MULT * sigma });
+      seg.lower.push({ time: c.time, value: m - SIGMA_MULT * sigma });
+    }
+    segments.push(seg);
+  }
+  return segments;
 }
+
 function setVwapData(candles) {
-  const vb = _vwapBands(candles);
-  vwapSeries.setData(vb.vwap);
-  upperSeries.setData(vb.upper);
-  lowerSeries.setData(vb.lower);
+  // Wipe ALL pool series first.
+  for (const t of VWAP_DAY_POOL) {
+    t.vwap.setData([]);
+    t.upper.setData([]);
+    t.lower.setData([]);
+  }
+  // Then populate one triplet per day.
+  const segments = _vwapBandsByDay(candles);
+  for (let i = 0; i < segments.length; i++) {
+    const t = _ensureVwapDay(i);
+    t.vwap.setData(segments[i].vwap);
+    t.upper.setData(segments[i].upper);
+    t.lower.setData(segments[i].lower);
+  }
 }
 
 // ============================================================
