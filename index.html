@@ -922,14 +922,26 @@ function hideCursorLine() {
 // ============================================================
 async function nextQuestion() {
   setLoading('Loading next session...');
-  const q = await generateQuestion();
-  if (!q) {
-    setLoading('Could not find a question. Try a shorter horizon.');
-    return;
+  try {
+    const q = await generateQuestion();
+    if (!q) {
+      setLoading('Could not find a question. Try a shorter horizon.');
+      return;
+    }
+    currentQ = q;
+    renderQuestion(q);
+    setLoading(null);
+  } catch (err) {
+    console.error('nextQuestion error:', err);
+    setLoading('Error loading next question. Tap to retry.');
+    // Make loading overlay tappable to retry.
+    const ov = document.getElementById('loading-overlay');
+    if (ov) {
+      ov.style.pointerEvents = 'auto';
+      ov.style.cursor = 'pointer';
+      ov.onclick = () => { ov.style.pointerEvents = 'none'; ov.onclick = null; nextQuestion(); };
+    }
   }
-  currentQ = q;
-  renderQuestion(q);
-  setLoading(null);
 }
 document.getElementById('btn-up').addEventListener('click', () => {
   if (answered || !currentQ) return;
