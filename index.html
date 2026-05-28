@@ -96,6 +96,33 @@
     min-height: 260px;
   }
   #chart { width: 100%; height: 100%; }
+  /* Vertical cursor line drawn at T after the user answers */
+  #cursor-line {
+    position: absolute;
+    top: 0; bottom: 0;
+    width: 0;
+    border-left: 2px dashed var(--yellow);
+    pointer-events: none;
+    z-index: 5;
+    display: none;
+  }
+  #cursor-line.show { display: block; }
+  #cursor-label {
+    position: absolute;
+    top: 6px;
+    transform: translateX(-50%);
+    padding: 2px 6px;
+    background: var(--yellow);
+    color: #000;
+    font-family: Consolas, monospace;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 3px;
+    pointer-events: none;
+    z-index: 5;
+    display: none;
+  }
+  #cursor-label.show { display: block; }
   #loading-overlay {
     position: absolute;
     inset: 0;
@@ -123,6 +150,25 @@
   #result-banner.show { display: flex; }
   #result-banner.correct { background: var(--green-dim); color: #bbf7d0; border: 1px solid var(--green); }
   #result-banner.wrong   { background: var(--red-dim);   color: #fecaca; border: 1px solid var(--red); }
+  #result-banner.multi   { background: var(--bg-elev); color: var(--text); border: 1px solid var(--border); flex-direction: column; align-items: stretch; padding: 6px 8px; }
+  /* Multi-horizon result table */
+  #multi-table { width: 100%; border-collapse: collapse; font-family: Consolas, monospace; font-size: 12px; }
+  #multi-table th, #multi-table td { padding: 4px 6px; text-align: right; border-bottom: 1px solid var(--border); }
+  #multi-table th { color: var(--text-dim); font-weight: 600; }
+  #multi-table td:first-child, #multi-table th:first-child { text-align: left; }
+  #multi-table tr.correct td.check { color: var(--green); font-weight: 700; }
+  #multi-table tr.wrong   td.check { color: var(--red);   font-weight: 700; }
+  #multi-table tr.na      td       { color: var(--text-dim); }
+  #multi-table td.up   { color: var(--green); }
+  #multi-table td.down { color: var(--red); }
+  #multi-summary {
+    margin-top: 4px;
+    font-family: Consolas, monospace;
+    font-size: 12px;
+    text-align: right;
+    color: var(--text-dim);
+  }
+  #multi-summary strong { color: var(--text); }
   /* ========== CONTROLS ========== */
   #controls {
     display: flex;
@@ -238,6 +284,8 @@
 
   <div id="chart-wrap">
     <div id="chart"></div>
+    <div id="cursor-line"></div>
+    <div id="cursor-label">YOU GUESSED</div>
     <div id="loading-overlay">Loading session...</div>
   </div>
 
@@ -248,6 +296,13 @@
 
   <div id="controls">
     <div class="horizon-row">
+      <label for="mode-sel">Mode</label>
+      <select id="mode-sel">
+        <option value="single" selected>Single horizon (scored)</option>
+        <option value="multi">Multi-horizon table (unscored)</option>
+      </select>
+    </div>
+    <div class="horizon-row">
       <label for="bucket-sel">Candle size</label>
       <select id="bucket-sel">
         <option value="30">30 sec</option>
@@ -257,7 +312,7 @@
         <option value="3600">Hourly</option>
       </select>
     </div>
-    <div class="horizon-row">
+    <div class="horizon-row" id="horizon-row-single">
       <label for="horizon-sel">Predict direction in</label>
       <select id="horizon-sel">
         <option value="5">5 min</option>
@@ -295,9 +350,23 @@ const NEUTRAL_THRESHOLD_PCT = 0.10;
 const RTH_START_MIN = 9 * 60 + 35;
 const LS_STATS_KEY  = 'scalp_quiz_stats_v1';
 const LS_BUCKET_KEY = 'scalp_quiz_bucket_seconds';
+const LS_MODE_KEY = 'scalp_quiz_mode';
 // Mutable: user can change this via the bucket dropdown. Source data is 1-min,
 // so values below 60 just produce identical-OHLC bars (no extra detail).
 let BUCKET_SECONDS = parseInt(localStorage.getItem(LS_BUCKET_KEY) || '60', 10);
+let MODE = localStorage.getItem(LS_MODE_KEY) || 'single';   // 'single' | 'multi'
+
+// Horizons checked in multi-horizon mode. Each tuple: [label, seconds_from_T].
+// 'close' is special-cased -- horizon ends at 15:55 ET same day.
+const MULTI_HORIZONS = [
+  { label: '10 min',  sec:  10 * 60 },
+  { label: '30 min',  sec:  30 * 60 },
+  { label: '1 hour',  sec:  60 * 60 },
+  { label: '2 hour',  sec: 120 * 60 },
+  { label: '3 hour',  sec: 180 * 60 },
+  { label: '4 hour',  sec: 240 * 60 },
+  { label: 'Close',   sec:  null     },   // 15:55 ET same day
+];
 
 // ============================================================
 // STATE
@@ -429,6 +498,14 @@ function initChart() {
     lastValueVisible: false,
   });
   VWAP_DAY_POOL.push({ vwap: vwapSeries, upper: upperSeries, lower: lowerSeries });
+  // Keep the cursor line glued to T when the user pans/zooms the chart.
+  chart.timeScale().subscribeVisibleTimeRangeChange(() => {
+    if (answered && currentQ) drawCursorLine(currentQ.T);
+  });
+  // Also reposition on window resize.
+  window.addEventListener('resize', () => {
+    if (answered && currentQ) drawCursorLine(currentQ.T);
+  });
 }
 
 // One {vwap, upper, lower} triplet per RTH day visible on the chart, so
@@ -623,7 +700,9 @@ async function generateQuestion(maxAttempts = 8) {
       contextBars.push(b);
     }
     if (contextBars.length < 20) continue;
-    const futureBars = bars.filter(b => b.t > T && b.t <= outcomeBar.t);
+    // futureBars now extends to the END OF TODAY'S DATA (not just the
+    // outcome horizon) so reveal shows the rest of the day after the guess.
+    const futureBars = bars.filter(b => b.t > T);
     return {
       ticker: session.ticker,
       date: session.date,
@@ -635,6 +714,7 @@ async function generateQuestion(maxAttempts = 8) {
       actualUp,
       contextBars,
       futureBars,
+      todayBars: bars,    // full today bars, used for multi-horizon outcome lookup
     };
   }
   return null;
@@ -649,6 +729,7 @@ function setLoading(text) {
   else      { el.classList.add('hidden'); }
 }
 function renderQuestion(q) {
+  hideCursorLine();
   document.getElementById('q-ticker').textContent = q.ticker;
   document.getElementById('q-time').textContent = fmtETTime(q.T);
   const candles = aggregateToBucket(q.contextBars, BUCKET_SECONDS);
@@ -673,36 +754,160 @@ function renderQuestion(q) {
   document.getElementById('btn-down').disabled = false;
   answered = false;
 }
+// Returns the price at-or-just-after target_t in todayBars. null if none.
+function _priceAtOrAfter(bars, target_t) {
+  for (const b of bars) {
+    if (b.t >= target_t) return b.c;
+  }
+  return null;
+}
+// 3:55 PM ET close for the day containing T (fake-UTC convention -> just set
+// UTC HH:MM on the same calendar day). Returns ts or null.
+function _closeTsOf(T) {
+  const d = new Date(T * 1000);
+  const close = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 15, 55, 0));
+  return Math.floor(close.getTime() / 1000);
+}
+function _renderMultiTable(userSaidUp) {
+  const banner = document.getElementById('result-banner');
+  // Remove single-mode markers/classes; switch to multi layout.
+  banner.className = '';
+  banner.classList.add('show', 'multi');
+  // Clear existing inner children, then rebuild as table.
+  while (banner.firstChild) banner.removeChild(banner.firstChild);
+  const table = document.createElement('table');
+  table.id = 'multi-table';
+  const head = document.createElement('thead');
+  const trh = document.createElement('tr');
+  for (const h of ['Horizon', 'Then', '% move', 'Your call']) {
+    const th = document.createElement('th');
+    th.textContent = h;
+    trh.appendChild(th);
+  }
+  head.appendChild(trh);
+  table.appendChild(head);
+  const body = document.createElement('tbody');
+  let correctCount = 0, totalChecked = 0;
+  for (const h of MULTI_HORIZONS) {
+    const tr = document.createElement('tr');
+    const target_t = (h.sec === null) ? _closeTsOf(currentQ.T) : currentQ.T + h.sec;
+    const priceAtH = _priceAtOrAfter(currentQ.todayBars, target_t);
+    // Build cells
+    const cLabel = document.createElement('td'); cLabel.textContent = h.label; tr.appendChild(cLabel);
+    const cDir   = document.createElement('td');
+    const cPct   = document.createElement('td');
+    const cChk   = document.createElement('td');
+    cChk.className = 'check';
+    if (priceAtH === null) {
+      cDir.textContent = '-'; cPct.textContent = '-'; cChk.textContent = 'n/a';
+      tr.classList.add('na');
+    } else {
+      const pct = (priceAtH - currentQ.priceAtT) / currentQ.priceAtT * 100;
+      const wentUp = pct > 0.05;       // small threshold to avoid noise calls
+      const wentDown = pct < -0.05;
+      cDir.textContent = wentUp ? '▲' : (wentDown ? '▼' : '·');
+      cDir.className = wentUp ? 'up' : (wentDown ? 'down' : '');
+      cPct.textContent = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+      const userCorrect = (userSaidUp && wentUp) || (!userSaidUp && wentDown);
+      const userWrong   = (userSaidUp && wentDown) || (!userSaidUp && wentUp);
+      if (userCorrect) {
+        cChk.textContent = '✓';
+        tr.classList.add('correct');
+        correctCount++; totalChecked++;
+      } else if (userWrong) {
+        cChk.textContent = '✗';
+        tr.classList.add('wrong');
+        totalChecked++;
+      } else {
+        cChk.textContent = '~';   // flat / inconclusive
+      }
+    }
+    tr.appendChild(cDir); tr.appendChild(cPct); tr.appendChild(cChk);
+    body.appendChild(tr);
+  }
+  table.appendChild(body);
+  banner.appendChild(table);
+  // Summary row
+  const summary = document.createElement('div');
+  summary.id = 'multi-summary';
+  const yourPick = userSaidUp ? 'UP' : 'DOWN';
+  summary.innerHTML = '';   // intentionally empty before populating safely
+  const yp = document.createElement('strong'); yp.textContent = 'You said ' + yourPick;
+  summary.appendChild(yp);
+  summary.appendChild(document.createTextNode(' · correct at '));
+  const score = document.createElement('strong');
+  score.textContent = correctCount + '/' + totalChecked;
+  summary.appendChild(score);
+  summary.appendChild(document.createTextNode(' horizons'));
+  banner.appendChild(summary);
+}
 function revealOutcome(userSaidUp) {
   const all = currentQ.contextBars.concat(currentQ.futureBars);
   const candles = aggregateToBucket(all, BUCKET_SECONDS);
   candleSeries.setData(candles);
   setVwapData(candles);
-  // Zoom in on the cursor area + outcome horizon so the user can clearly
-  // see what actually happened. ~3h before T through horizon + 30 min buffer.
+  // Reveal zoom: from 3h before T through end of today's data.
+  const todayBars = currentQ.todayBars || all;
+  const lastT = todayBars[todayBars.length - 1].t;
   try {
     chart.timeScale().setVisibleRange({
       from: currentQ.T - 3 * 3600,
-      to:   currentQ.T + (currentQ.horizonMin + 30) * 60,
+      to:   Math.max(lastT, currentQ.T + 60 * 60),
     });
   } catch (e) {
     chart.timeScale().fitContent();
   }
-  const correct = userSaidUp === currentQ.actualUp;
-  recordResult(correct, currentQ.horizonMin, currentQ.ticker);
-  const banner = document.getElementById('result-banner');
-  banner.classList.add('show');
-  banner.classList.add(correct ? 'correct' : 'wrong');
-  document.getElementById('result-verdict').textContent = correct ? 'Correct' : 'Wrong';
-  const pctStr = (currentQ.pct >= 0 ? '+' : '') + currentQ.pct.toFixed(2) + '%';
-  const yourPick = userSaidUp ? 'UP' : 'DOWN';
-  const truth = currentQ.actualUp ? 'UP' : 'DOWN';
-  document.getElementById('result-detail').textContent =
-    'You: ' + yourPick + ' | Actual: ' + truth + ' (' + pctStr + ')';
+  if (MODE === 'multi') {
+    _renderMultiTable(userSaidUp);
+    // No stats updated in multi mode -- unscored.
+  } else {
+    const correct = userSaidUp === currentQ.actualUp;
+    recordResult(correct, currentQ.horizonMin, currentQ.ticker);
+    const banner = document.getElementById('result-banner');
+    // Reset banner content layout to single mode.
+    while (banner.firstChild) banner.removeChild(banner.firstChild);
+    const verdict = document.createElement('span'); verdict.id = 'result-verdict';
+    const detail = document.createElement('span'); detail.id = 'result-detail';
+    banner.appendChild(verdict); banner.appendChild(detail);
+    banner.className = '';
+    banner.classList.add('show', correct ? 'correct' : 'wrong');
+    verdict.textContent = correct ? 'Correct' : 'Wrong';
+    const pctStr = (currentQ.pct >= 0 ? '+' : '') + currentQ.pct.toFixed(2) + '%';
+    const yourPick = userSaidUp ? 'UP' : 'DOWN';
+    const truth = currentQ.actualUp ? 'UP' : 'DOWN';
+    detail.textContent = 'You: ' + yourPick + ' | Actual: ' + truth + ' (' + pctStr + ')';
+  }
+  // Draw the cursor vertical line at T.
+  drawCursorLine(currentQ.T);
   document.getElementById('btn-up').disabled = true;
   document.getElementById('btn-down').disabled = true;
   document.getElementById('next-btn').classList.add('show');
   answered = true;
+}
+
+// Cursor line: a yellow dashed vertical line at T after the user answers.
+function drawCursorLine(t) {
+  const line = document.getElementById('cursor-line');
+  const label = document.getElementById('cursor-label');
+  if (!line || !label) return;
+  const x = chart.timeScale().timeToCoordinate(t);
+  if (x === null || x === undefined) {
+    line.classList.remove('show');
+    label.classList.remove('show');
+    return;
+  }
+  // Chart canvas sits inside #chart-wrap; the chart's price-axis is at the
+  // RIGHT of the canvas. Position relative to chart-wrap.
+  line.style.left = x + 'px';
+  label.style.left = x + 'px';
+  line.classList.add('show');
+  label.classList.add('show');
+}
+function hideCursorLine() {
+  const line = document.getElementById('cursor-line');
+  const label = document.getElementById('cursor-label');
+  if (line) line.classList.remove('show');
+  if (label) label.classList.remove('show');
 }
 
 // ============================================================
@@ -757,6 +962,26 @@ if (_bucketSel) {
     BUCKET_SECONDS = v;
     localStorage.setItem(LS_BUCKET_KEY, String(v));
     _redrawAtCurrentBucket();
+  });
+}
+
+// Mode dropdown: 'single' vs 'multi'. In multi mode, hide the horizon
+// dropdown (since multiple horizons are evaluated) and don't update stats.
+function _applyMode() {
+  const row = document.getElementById('horizon-row-single');
+  if (row) row.style.display = (MODE === 'multi') ? 'none' : '';
+}
+const _modeSel = document.getElementById('mode-sel');
+if (_modeSel) {
+  _modeSel.value = MODE;
+  _applyMode();
+  _modeSel.addEventListener('change', e => {
+    MODE = e.target.value;
+    localStorage.setItem(LS_MODE_KEY, MODE);
+    _applyMode();
+    // If a question is currently displayed and unanswered, the bar set is
+    // already generic (uses 30 min horizon by default for outcome data) -- no
+    // need to regenerate. Just update visibility.
   });
 }
 document.getElementById('reset-stats-btn').addEventListener('click', () => {
