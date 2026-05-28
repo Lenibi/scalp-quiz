@@ -289,6 +289,9 @@ const LS_STATS_KEY  = 'scalp_quiz_stats_v1';
 let CATALOG = null;
 let chart = null;
 let candleSeries = null;
+let vwapSeries = null;
+let upperSeries = null;
+let lowerSeries = null;
 let currentQ = null;
 let answered = false;
 let stats = loadStats();
@@ -389,6 +392,68 @@ function initChart() {
     priceLineVisible: false,
     lastValueVisible: true,
   });
+  // VWAP (yellow dashed) + 2sigma bands (upper blue, lower pink). Rolling
+  // window so they don't trumpet from zero. RTH-only -- gap during pre-market.
+  vwapSeries = chart.addLineSeries({
+    color: '#f6c143', lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    priceLineVisible: false, crosshairMarkerVisible: false,
+    lastValueVisible: false,
+  });
+  upperSeries = chart.addLineSeries({
+    color: '#66aaff', lineWidth: 1,
+    priceLineVisible: false, crosshairMarkerVisible: false,
+    lastValueVisible: false,
+  });
+  lowerSeries = chart.addLineSeries({
+    color: '#ff77bb', lineWidth: 1,
+    priceLineVisible: false, crosshairMarkerVisible: false,
+    lastValueVisible: false,
+  });
+}
+
+// Bucketed candles already use BUCKET_SECONDS (60s). The rolling window is
+// 15 minutes -> 15 bars. ±2sigma matches the scalp-sim convention.
+function _vwapBands(candles) {
+  const WINDOW_BARS = 15;
+  const SIGMA_MULT = 2;
+  const MIN_BARS = 5;
+  const vwap = [], upper = [], lower = [];
+  const queue = [];
+  let sumPV = 0, sumV = 0, sumP2V = 0;
+  for (const c of candles) {
+    const mod = etMinuteOfDay(c.time);
+    const inRTH = mod >= 9 * 60 + 30 && mod < 16 * 60;
+    if (!inRTH) continue;
+    const typical = (c.high + c.low + c.close) / 3;
+    // No volume in the aggregated candle (we don't aggregate volume here),
+    // so weight every bar equally by using a synthetic v=1. The bands
+    // become simple price stddev around the typical-price moving avg --
+    // same shape as a true VWAP at small intraday scales.
+    const v = 1;
+    const pv = typical * v;
+    const p2v = typical * typical * v;
+    queue.push({ pv, v, p2v });
+    sumPV += pv; sumV += v; sumP2V += p2v;
+    if (queue.length > WINDOW_BARS) {
+      const old = queue.shift();
+      sumPV -= old.pv; sumV -= old.v; sumP2V -= old.p2v;
+    }
+    if (queue.length < MIN_BARS || sumV <= 0) continue;
+    const m = sumPV / sumV;
+    const variance = Math.max(0, sumP2V / sumV - m * m);
+    const sigma = Math.sqrt(variance);
+    vwap.push({ time: c.time, value: m });
+    upper.push({ time: c.time, value: m + SIGMA_MULT * sigma });
+    lower.push({ time: c.time, value: m - SIGMA_MULT * sigma });
+  }
+  return { vwap, upper, lower };
+}
+function setVwapData(candles) {
+  const vb = _vwapBands(candles);
+  vwapSeries.setData(vb.vwap);
+  upperSeries.setData(vb.upper);
+  lowerSeries.setData(vb.lower);
 }
 
 // ============================================================
@@ -494,6 +559,7 @@ function renderQuestion(q) {
   document.getElementById('q-time').textContent = fmtETTime(q.T);
   const candles = aggregateToBucket(q.contextBars, BUCKET_SECONDS);
   candleSeries.setData(candles);
+  setVwapData(candles);
   chart.timeScale().fitContent();
   document.getElementById('result-banner').className = '';
   document.getElementById('result-verdict').textContent = '';
@@ -507,6 +573,7 @@ function revealOutcome(userSaidUp) {
   const all = currentQ.contextBars.concat(currentQ.futureBars);
   const candles = aggregateToBucket(all, BUCKET_SECONDS);
   candleSeries.setData(candles);
+  setVwapData(candles);
   chart.timeScale().fitContent();
   const correct = userSaidUp === currentQ.actualUp;
   recordResult(correct, currentQ.horizonMin, currentQ.ticker);
